@@ -58,17 +58,25 @@ The ratio is upstream elapsed time divided by mojo-mappy elapsed time.
 
 | case | mojo-mappy | upstream mappy | ratio |
 | --- | ---: | ---: | ---: |
-| index build (500 kb, k=15/w=10) | 63.5 ms | 42.8 ms | 0.67x |
-| exact-read map (200 kb) | 139.9 ms | 70.3 ms | 0.50x |
+| index build (500 kb, k=15/w=10) | 24.1 ms | 30.2 ms | 1.25x |
+| exact-read map (200 kb) | 27.5 ms | 63.7 ms | 2.32x |
 
-The index-build loss is expected: this port's reusable Python dictionary index
-is not minimap2's compact C hash table. Mapping includes upstream's base-level
-alignment, which this chain-only port deliberately does not perform.
+The reference index keeps minimizer fields in sorted contiguous NumPy buffers.
+Query lookup and repeated-hit expansion use vectorized array operations, while
+the Python dictionary-shaped debug view is created only if `_index` is
+inspected. Large multi-reference inputs sketch independent references
+concurrently; inputs below one million total bases stay serial to avoid thread
+launch overhead. Mapping includes upstream's base-level alignment, which this
+chain-only port deliberately does not perform.
 
-No SIMD, parallel, or GPU path is used. Sketching is a rolling state machine,
-the chain recurrence depends on prior scores, and their low arithmetic
-intensity makes vector lanes, thread launches, and device transfers lose to the
-serial CPU implementation for these kernels.
+The array lookup, expansion, grouping, and coordinate reductions run in
+NumPy's native vectorized kernels. The Mojo sketch and chain loops remain
+scalar: sketching is a rolling state machine and the chain recurrence depends
+on prior scores and skip state, so forcing either across SIMD lanes would
+change ordering semantics or add a losing staging pass. No GPU path is used.
+Both kernels perform integer and control-flow work with low useful arithmetic
+intensity; host/device transfers and divergent execution would dominate, so a
+GPU path is not justified.
 
 ## How it works
 

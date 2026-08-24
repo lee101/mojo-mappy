@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 
 import mappy as mm
+import mappy.core as core
 from mappy._lib import addr
 from mappy.core import _Anchor
 
@@ -184,6 +185,27 @@ def test_index_handles_singleton_and_repeated_minimizers():
     hit = next(aligner.map(sequence))
     assert (hit.q_st, hit.q_en) == (hit.r_st, hit.r_en)
     assert 0 <= hit.q_st < hit.q_en <= len(sequence)
+
+
+def test_parallel_reference_sketch_matches_serial(tmp_path: Path, monkeypatch):
+    fasta = tmp_path / "references.fa"
+    fasta.write_text(">a\n" + "ACGTTGCA" * 100 + "\n>b\n" + "TGCACGTT" * 100 + "\n")
+    monkeypatch.setattr(core, "_PARALLEL_SKETCH_THRESHOLD", 1)
+    serial = mm.Aligner(fasta, k=7, w=5, n_threads=1)
+    parallel = mm.Aligner(fasta, k=7, w=5, n_threads=2)
+    assert parallel._index == serial._index
+
+
+def test_vectorized_seed_expansion_handles_remainder_and_no_matches():
+    rng = np.random.default_rng(59)
+    reference = "".join(rng.choice(np.array(list("ACGT")), size=1021))
+    aligner = mm.Aligner(seq=reference, k=7, w=5, min_cnt=1, min_chain_score=1)
+    query = reference[317:430]
+    hit = next(aligner.map(query))
+    assert hit.strand == 1
+    assert 317 <= hit.r_st <= 324
+    assert 423 <= hit.r_en <= 430
+    assert list(aligner.map("N" * 113)) == []
 
 
 def test_ffi_rejects_wrong_dtype_and_non_writable_outputs():

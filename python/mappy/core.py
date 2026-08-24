@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections import defaultdict, namedtuple
+from collections import namedtuple
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import gzip
 import math
@@ -15,6 +16,8 @@ import numpy as np
 from ._lib import addr, lib
 
 Minimizer = namedtuple("Minimizer", "hash pos strand span")
+
+_PARALLEL_SKETCH_THRESHOLD = 1_000_000
 
 
 def _integer(value, name: str) -> int:
@@ -112,14 +115,23 @@ def chain(
     max_skip = _integer(max_skip, "max_skip")
     if max_gap < 0 or bandwidth < 0 or max_skip < 0 or not math.isfinite(gap_scale) or gap_scale < 0:
         raise ValueError("chain parameters must be non-negative")
-    scores = np.empty(len(values), dtype=np.int64)
-    predecessors = np.empty(len(values), dtype=np.int64)
+    return _chain_arrays(reference, query, spans, max_gap, bandwidth, max_skip,
+                         int(round(gap_scale * int(spans.max()))))
+
+
+def _chain_arrays(reference: np.ndarray, query: np.ndarray, spans: np.ndarray,
+                  max_gap: int, bandwidth: int, max_skip: int,
+                  penalty_scale: int) -> tuple[int, list[int]]:
+    """Chain validated, contiguous arrays without recreating Python records."""
+    n = len(reference)
+    scores = np.empty(n, dtype=np.int64)
+    predecessors = np.empty(n, dtype=np.int64)
     last = lib().mmp_chain_dp(
-        addr(reference, np.int64), addr(query, np.int64), addr(spans, np.int64), len(values), max_gap,
-        bandwidth, max_skip, int(round(gap_scale * int(spans.max()))),
+        addr(reference, np.int64), addr(query, np.int64), addr(spans, np.int64), n, max_gap,
+        bandwidth, max_skip, penalty_scale,
         addr(scores, np.int64, writable=True), addr(predecessors, np.int64, writable=True),
     )
-    if not 0 <= last < len(values):
+    if not 0 <= last < n:
         raise RuntimeError("Mojo chaining kernel returned an invalid predecessor index")
     path: list[int] = []
     while last >= 0:
@@ -194,7 +206,7 @@ class Aligner:
                  best_n=None, n_threads=3, fn_idx_out=None, max_frag_len=None,
                  extra_flags=None, seq=None, scoring=None, sc_ambi=None,
                  max_chain_skip=None):
-        del min_dp_score, bw_long, n_threads, fn_idx_out, max_frag_len, extra_flags, scoring, sc_ambi
+        del min_dp_score, bw_long, fn_idx_out, max_frag_len, extra_flags, scoring, sc_ambi
         defaults = {"sr": (21, 11), "map-pb": (19, 10), "map-ont": (15, 10),
                     "asm5": (19, 19), "asm10": (19, 19), "splice": (15, 5)}
         if preset is not None and preset not in defaults:
@@ -207,23 +219,59 @@ class Aligner:
         self.bw = _integer(500 if bw is None else bw, "bw")
         self.best_n = _integer(5 if best_n is None else best_n, "best_n")
         self.max_chain_skip = _integer(25 if max_chain_skip is None else max_chain_skip, "max_chain_skip")
+        n_threads = _integer(n_threads, "n_threads")
         if not 1 <= self.k <= 28 or not 1 <= self.w <= 255:
             raise ValueError("k must be in 1..28 and w must be in 1..255")
-        if self.min_cnt < 0 or self.min_chain_score < 0 or self.bw < 0 or self.best_n < 0 or self.max_chain_skip < 0:
+        if self.min_cnt < 0 or self.min_chain_score < 0 or self.bw < 0 or self.best_n < 0 or self.max_chain_skip < 0 or n_threads < 1:
             raise ValueError("mapping thresholds must be non-negative")
         self._references = self._load_references(fn_idx_in, seq)
-        self._index: dict[int, tuple[int, int, int] | list[tuple[int, int, int]]] = {}
-        for rid, (_, reference) in enumerate(self._references):
-            hashes, positions, strands = _sketch_arrays(reference, self.k, self.w)
-            for seed_hash, position, strand in zip(hashes.tolist(), positions.tolist(), strands.tolist()):
+        if (n_threads > 1 and len(self._references) > 1
+                and sum(len(reference) for _, reference in self._references) >= _PARALLEL_SKETCH_THRESHOLD):
+            lib()
+            with ThreadPoolExecutor(max_workers=min(n_threads, len(self._references))) as executor:
+                sketches = list(executor.map(
+                    lambda item: _sketch_arrays(item[1], self.k, self.w), self._references
+                ))
+        else:
+            sketches = [_sketch_arrays(reference, self.k, self.w)
+                        for _, reference in self._references]
+        if sketches:
+            all_hashes = np.concatenate([item[0] for item in sketches])
+            all_positions = np.concatenate([item[1] for item in sketches])
+            all_strands = np.concatenate([item[2] for item in sketches])
+            all_rids = np.concatenate([
+                np.full(len(item[0]), rid, dtype=np.int64)
+                for rid, item in enumerate(sketches)
+            ])
+            order = np.argsort(all_hashes, kind="stable")
+            self._index_hashes = all_hashes[order]
+            self._index_positions = all_positions[order]
+            self._index_strands = all_strands[order]
+            self._index_rids = all_rids[order]
+        else:
+            self._index_hashes = np.empty(0, dtype=np.uint64)
+            self._index_positions = np.empty(0, dtype=np.int64)
+            self._index_strands = np.empty(0, dtype=np.int64)
+            self._index_rids = np.empty(0, dtype=np.int64)
+        self.__index_view = None
+
+    @property
+    def _index(self) -> dict[int, tuple[int, int, int] | list[tuple[int, int, int]]]:
+        if self.__index_view is None:
+            view: dict[int, tuple[int, int, int] | list[tuple[int, int, int]]] = {}
+            for seed_hash, rid, position, strand in zip(
+                    self._index_hashes.tolist(), self._index_rids.tolist(),
+                    self._index_positions.tolist(), self._index_strands.tolist()):
                 hit = (rid, position, strand)
-                previous = self._index.get(seed_hash)
+                previous = view.get(seed_hash)
                 if previous is None:
-                    self._index[seed_hash] = hit
+                    view[seed_hash] = hit
                 elif isinstance(previous, tuple):
-                    self._index[seed_hash] = [previous, hit]
+                    view[seed_hash] = [previous, hit]
                 else:
                     previous.append(hit)
+            self.__index_view = view
+        return self.__index_view
 
     @staticmethod
     def _load_references(fn_idx_in, seq):
@@ -254,30 +302,51 @@ class Aligner:
         if seq2 is not None:
             raise NotImplementedError("paired-end mapping is outside the chaining subset")
         query = seq.decode() if isinstance(seq, bytes) else str(seq)
-        grouped: dict[tuple[int, int], list[tuple[int, int, int, int]]] = defaultdict(list)
-        for qseed in sketch(query, self.k, self.w):
-            matches = self._index.get(qseed.hash)
-            if matches is None:
-                continue
-            if isinstance(matches, tuple):
-                matches = (matches,)
-            for rid, rpos, rstrand in matches:
-                strand = 1 if rstrand == qseed.strand else -1
-                # The DP requires increasing coordinates.  For reverse hits use
-                # the query's reverse-complement k-mer end coordinate, while
-                # retaining the original coordinate for the public result.
-                chain_qpos = qseed.pos if strand > 0 else len(query) - qseed.pos + self.k - 1
-                grouped[(rid, strand)].append((rpos, chain_qpos, self.k, qseed.pos))
+        hashes, positions, strands = _sketch_arrays(query, self.k, self.w)
+        query_length = len(query)
+        k = self.k
+        left = np.searchsorted(self._index_hashes, hashes, side="left")
+        right = np.searchsorted(self._index_hashes, hashes, side="right")
+        counts = right - left
+        matched = counts > 0
+        counts = counts[matched]
+        if not counts.size:
+            return
+        left = left[matched]
+        offsets = np.arange(int(counts.sum()), dtype=np.int64)
+        starts = np.repeat(np.cumsum(counts) - counts, counts)
+        reference_indices = np.repeat(left, counts) + offsets - starts
+        query_positions = np.repeat(positions[matched], counts)
+        query_strands = np.repeat(strands[matched], counts)
+        reference_positions = self._index_positions[reference_indices]
+        reference_strands = self._index_strands[reference_indices]
+        reference_ids = self._index_rids[reference_indices]
+        hit_strands = np.where(reference_strands == query_strands, 1, -1)
+        chain_positions = np.where(
+            hit_strands > 0, query_positions, query_length - query_positions + k - 1
+        )
+        group_codes = reference_ids * 2 + (hit_strands > 0)
         hits = []
-        for (rid, strand), anchors in grouped.items():
-            anchors.sort()
-            score, path = chain(anchors, bandwidth=self.bw, max_skip=self.max_chain_skip)
+        for group_code in np.unique(group_codes):
+            selected = group_codes == group_code
+            rpos = reference_positions[selected]
+            chain_qpos = chain_positions[selected]
+            original_qpos = query_positions[selected]
+            order = np.lexsort((original_qpos, chain_qpos, rpos))
+            rpos = np.ascontiguousarray(rpos[order])
+            chain_qpos = np.ascontiguousarray(chain_qpos[order])
+            original_qpos = original_qpos[order]
+            spans = np.full(len(rpos), k, dtype=np.int64)
+            score, path = _chain_arrays(rpos, chain_qpos, spans, 5000, self.bw,
+                                        self.max_chain_skip, int(round(0.8 * k)))
             if len(path) < self.min_cnt or score < self.min_chain_score:
                 continue
-            selected = [anchors[i] for i in path]
-            r_st, r_en = selected[0][0] - self.k + 1, selected[-1][0] + 1
-            q_positions = [a[3] for a in selected]
-            q_st, q_en = min(q_positions) - self.k + 1, max(q_positions) + 1
+            r_st, r_en = int(rpos[path[0]]) - k + 1, int(rpos[path[-1]]) + 1
+            path_qpos = original_qpos[path]
+            q_min, q_max = int(path_qpos.min()), int(path_qpos.max())
+            q_st, q_en = q_min - k + 1, q_max + 1
+            rid = int(group_code) // 2
+            strand = 1 if int(group_code) & 1 else -1
             ctg, reference = self._references[rid]
             hits.append(Alignment(ctg, len(reference), max(0, q_st), q_en,
                                   max(0, r_st), r_en, strand, score, len(path), True))
