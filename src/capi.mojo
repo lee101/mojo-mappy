@@ -65,7 +65,7 @@ def mmp_sketch(
     var count = 0
     var i = 0
     while i < length:
-        var c = nt4(seq.load(i))
+        var c = nt4(seq.unsafe_load(i))
         var info_hash = invalid
         var info_meta = invalid
         if c < 4:
@@ -87,20 +87,20 @@ def mmp_sketch(
         if valid == w + k - 1 and min_hash != invalid:
             var j = ring_pos + 1
             while j < w:
-                if min_hash == ring_hash.load(j) and min_meta != ring_meta.load(j):
+                if min_hash == ring_hash.unsafe_load(j) and min_meta != ring_meta.unsafe_load(j):
                     if count >= output_capacity:
                         return -1
                     hashes.store(count, min_hash)
-                    positions.store(count, Int(ring_meta.load(j) >> 1))
-                    strands.store(count, Int(ring_meta.load(j) & UInt64(1)))
+                    positions.store(count, Int(ring_meta.unsafe_load(j) >> 1))
+                    strands.store(count, Int(ring_meta.unsafe_load(j) & UInt64(1)))
                     count += 1
                 j += 1
             j = 0
             while j < ring_pos:
-                if min_hash == ring_hash.load(j) and min_meta != ring_meta.load(j):
+                if min_hash == ring_hash.unsafe_load(j) and min_meta != ring_meta.unsafe_load(j):
                     hashes.store(count, min_hash)
-                    positions.store(count, Int(ring_meta.load(j) >> 1))
-                    strands.store(count, Int(ring_meta.load(j) & UInt64(1)))
+                    positions.store(count, Int(ring_meta.unsafe_load(j) >> 1))
+                    strands.store(count, Int(ring_meta.unsafe_load(j) & UInt64(1)))
                     count += 1
                 j += 1
         if info_hash <= min_hash:
@@ -125,35 +125,35 @@ def mmp_sketch(
             min_hash = invalid
             var j = ring_pos + 1
             while j < w:
-                if min_hash >= ring_hash.load(j):
-                    min_hash = ring_hash.load(j)
-                    min_meta = ring_meta.load(j)
+                if min_hash >= ring_hash.unsafe_load(j):
+                    min_hash = ring_hash.unsafe_load(j)
+                    min_meta = ring_meta.unsafe_load(j)
                     min_pos = j
                 j += 1
             j = 0
             while j <= ring_pos:
-                if min_hash >= ring_hash.load(j):
-                    min_hash = ring_hash.load(j)
-                    min_meta = ring_meta.load(j)
+                if min_hash >= ring_hash.unsafe_load(j):
+                    min_hash = ring_hash.unsafe_load(j)
+                    min_meta = ring_meta.unsafe_load(j)
                     min_pos = j
                 j += 1
             if valid >= w + k - 1 and min_hash != invalid:
                 j = ring_pos + 1
                 while j < w:
-                    if min_hash == ring_hash.load(j) and min_meta != ring_meta.load(j):
+                    if min_hash == ring_hash.unsafe_load(j) and min_meta != ring_meta.unsafe_load(j):
                         if count >= output_capacity:
                             return -1
                         hashes.store(count, min_hash)
-                        positions.store(count, Int(ring_meta.load(j) >> 1))
-                        strands.store(count, Int(ring_meta.load(j) & UInt64(1)))
+                        positions.store(count, Int(ring_meta.unsafe_load(j) >> 1))
+                        strands.store(count, Int(ring_meta.unsafe_load(j) & UInt64(1)))
                         count += 1
                     j += 1
                 j = 0
                 while j <= ring_pos:
-                    if min_hash == ring_hash.load(j) and min_meta != ring_meta.load(j):
+                    if min_hash == ring_hash.unsafe_load(j) and min_meta != ring_meta.unsafe_load(j):
                         hashes.store(count, min_hash)
-                        positions.store(count, Int(ring_meta.load(j) >> 1))
-                        strands.store(count, Int(ring_meta.load(j) & UInt64(1)))
+                        positions.store(count, Int(ring_meta.unsafe_load(j) >> 1))
+                        strands.store(count, Int(ring_meta.unsafe_load(j) & UInt64(1)))
                         count += 1
                     j += 1
         ring_pos += 1
@@ -204,28 +204,28 @@ def mmp_chain_dp(
     var best_index = 0
     var i = 0
     while i < n:
-        var qi = query.load(i)
-        var ri = reference.load(i)
-        var best_score = spans.load(i)
+        var qi = query.unsafe_load(i)
+        var ri = reference.unsafe_load(i)
+        var best_score = spans.unsafe_load(i)
         var best_prev = -1
         var skips = 0
         var j = i - 1
         while j >= 0:
-            var dq = qi - query.load(j)
-            var dr = ri - reference.load(j)
+            var dq = qi - query.unsafe_load(j)
+            var dr = ri - reference.unsafe_load(j)
             if dr > max_gap:
                 break
             if dq > 0 and dr > 0 and dq <= max_gap:
                 var diagonal = dr - dq if dr > dq else dq - dr
                 if diagonal <= bandwidth:
                     var gap = dr if dr < dq else dq
-                    var span = spans.load(j)
+                    var span = spans.unsafe_load(j)
                     var contribution = span if span < gap else gap
                     if diagonal > 0 or gap > span:
                         var linear = penalty_scale * diagonal
                         var logarithmic = ilog2(diagonal + 1) if diagonal > 0 else 0
                         contribution -= (linear + 50 * logarithmic) / 100
-                    var candidate = scores.load(j) + contribution
+                    var candidate = scores.unsafe_load(j) + contribution
                     if candidate > best_score:
                         best_score = candidate
                         best_prev = j
@@ -238,7 +238,7 @@ def mmp_chain_dp(
             j -= 1
         scores.store(i, best_score)
         predecessors.store(i, best_prev)
-        if best_score > scores.load(best_index):
+        if best_score > scores.unsafe_load(best_index):
             best_index = i
         i += 1
     return best_index
